@@ -1,0 +1,446 @@
+---
+title: "Home Energy Forecaster"
+output:
+  flexdashboard::flex_dashboard:
+    logo: rsz_pge_logo.png
+    orientation: rows
+    theme:
+      bg: '#FFFFFF'
+      fg: '#424242'
+      primary: '#1F77B4'
+      navbar-bg: '#aec7e8'
+      base_font: bslib::font_google("Roboto")
+runtime: shiny
+resource_files:
+- artifacts/pge_best_models_tbl.rds
+- artifacts/pge_monthly_best_models_tbl.rds
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+    echo    = FALSE,
+    message = FALSE,
+    warning = FALSE
+)
+
+library(shiny)
+library(shinyjs)
+library(plotly)
+library(reactable)
+library(bslib)
+
+library(modeltime)
+library(tidymodels)
+
+library(tidyverse)
+library(timetk)
+library(ggthemes)
+library(lubridate)
+```
+
+
+```{r}
+# Load nested best models daily modeltime table
+# pge_daily_best_models_tbl <- read_rds("~/R/pge_project/artifacts/pge_best_models_tbl.rds")
+pge_daily_best_models_tbl <- read_rds("artifacts/pge_best_models_tbl.rds")
+
+# Time series selection
+selection_options <- pge_daily_best_models_tbl$type
+
+# Default inputs
+default_options <- selection_options[c(1)]
+
+# Load nested best models monthly modeltime table
+# pge_monthly_best_models_tbl <- read_rds("~/R/pge_project/artifacts/pge_monthly_best_models_tbl.rds")
+pge_monthly_best_models_tbl <- read_rds("artifacts/pge_monthly_best_models_tbl.rds")
+```
+
+
+## Column {.sidebar data-width=267}
+
+#### Objective
+
+Predict future energy costs and usage based on past data.
+
+<hr>
+
+#### Options
+
+```{r}
+# Use Shiny JavaScript for interactivity
+useShinyjs(rmd = TRUE)
+
+# Select which time series to forecast
+# shiny::selectInput(
+#     inputId   = "type",
+#     label     = "Choose what to forecast:",
+#     choices   = selection_options,
+#     selected  = default_options,
+#     selectize = TRUE, 
+#     multiple  = TRUE
+# )
+
+shiny::checkboxGroupInput(
+  inputId = "type",
+  label = "Choose what to forecast:",
+  choices = selection_options,
+  selected  = default_options,
+  inline = TRUE
+)
+
+# Select the daily forecasting horizon
+numericInput(
+    inputId = "daily_forecast_horizon", 
+    label   = "Choose number of days to forecast:", 
+    value   = 90, 
+    min     = 2
+)
+
+# Select the monthly forecasting horizon
+numericInput(
+    inputId = "monthly_forecast_horizon", 
+    label   = "Choose number of months to forecast:", 
+    value   = 12, 
+    min     = 1
+)
+
+shiny::sliderInput(
+    inputId = "conf_interval",
+    label   = "Choose confidence interval:",
+    min     = 0, 
+    max     = 1, 
+    value   = 0.95
+)
+
+# Action button to apply user inputs
+actionButton(inputId = "apply", label = "Apply", icon = icon("play"))
+
+# Action button to reset user inputs to default 
+actionButton(inputId = "reset", label = "Reset", icon = icon("sync"))
+
+# Watch for user to press reset then 'update' inputs to default 
+observeEvent(eventExpr = input$reset, handlerExpr = {
+    # Reset user 'type' inputs to default
+    updateSelectInput(
+        session  = session, 
+        inputId  = "type",
+        selected = default_options
+    )
+    # Reset daily forecast horizon to default
+    updateNumericInput(
+        inputId = "daily_forecast_horizon", 
+        value   = 90
+    )
+    
+    # Reset monthly forecast horizon to default
+    updateNumericInput(
+        inputId = "monthly_forecast_horizon", 
+        value   = 12
+    )
+    
+    # Reset confidence interval to default
+    updateSliderInput(
+        session = session, 
+        inputId = "conf_interval",
+        value   = 0.95
+    )
+  # Wait for shiny to get all the details and then reset  
+  shinyjs::delay(ms = 300, expr = {
+      shinyjs::click(id = "apply")
+  })
+ 
+  
+})
+```
+
+
+```{r}
+# Reactive logic
+rv <- reactiveValues()
+
+# Watch for user to press apply button
+observeEvent(input$apply, {
+    
+    # Filter for user's selections
+    rv$pge_daily_model_tbl <- pge_daily_best_models_tbl %>% filter(type %in% input$type)
+    
+    # Compute daily forecast 
+    rv$daily_forecast_tbl <- rv$pge_daily_model_tbl %>%
+        modeltime_nested_forecast(
+            h = input$daily_forecast_horizon,
+            conf_interval = input$conf_interval,
+            control = control_nested_forecast(
+                verbose   = TRUE,
+                allow_par = FALSE
+            )
+        )
+    
+    # Filter for user's selections
+    rv$pge_monthly_model_tbl <- pge_monthly_best_models_tbl %>% filter(type %in% input$type)
+    
+    # Compute monthly forecast 
+    rv$monthly_forecast_tbl <- rv$pge_monthly_model_tbl %>%
+        modeltime_nested_forecast(
+            h = input$monthly_forecast_horizon,
+            conf_interval = input$conf_interval,
+            control = control_nested_forecast(
+                verbose   = TRUE,
+                allow_par = FALSE
+            )
+        )
+    
+}, ignoreNULL = FALSE)
+```
+
+
+## Row {.tabset .tabset-fade}
+
+### Daily Predicted Forecast
+
+```{r}
+# Forecast predictions plot output
+output$plotly_daily_prediction <- renderPlotly({
+  
+    
+    # # Useful if adding more time series selections
+    facet_col <- 1
+    if (length(input$type) > 3) facet_col <- 2
+    if (length(input$type) > 8) facet_col <- 4
+    
+    
+    daily_forecast_plot <- rv$daily_forecast_tbl %>%
+      filter(type %in% input$type) %>%
+      rename(Model = .model_desc,
+             Value = .value,
+             Date = .index,
+             `CI Low` = .conf_lo,
+             `CI High` = .conf_hi) %>%
+      mutate(Model = str_to_title(Model)) %>%
+      mutate(Model = Model %>% str_trunc(width = 25)) %>%
+      group_by(type) %>%
+      ggplot(aes(x=Date,y=Value,color=Model)) + 
+      geom_line() + 
+      geom_ribbon(
+        aes(
+          ymin = `CI Low`,
+          ymax = `CI High`,
+          color = Model
+        ),
+        fill     = "grey20",
+        alpha    = 0.20,
+        linetype = 0
+      ) + 
+      theme_gdocs() +
+      scale_color_tableau() +
+      labs(color = "Legend") +
+      theme(plot.title = element_text(color = "#616161", face = "bold"),
+            legend.title = element_text(color = "#616161"),
+            legend.text = element_text(color = "#616161"),
+            text = element_text(family = "Roboto"),
+            strip.text = element_text(size=16)) + 
+      facet_wrap(~type, ncol=1)
+
+    ggplotly(daily_forecast_plot, dynamicTicks = TRUE)
+})
+
+plotlyOutput(outputId = "plotly_daily_prediction")
+```
+
+
+### Daily Model Fit
+
+```{r}
+output$plotly_daily_model_fit <- renderPlotly({
+  
+  # Useful if adding more time series selections
+  facet_col <- 1
+  if (length(input$type) > 3) facet_col <- 2
+  if (length(input$type) > 8) facet_col <- 4
+  
+  # Model fit plot
+  model_fit_test_plot <- rv$pge_daily_model_tbl %>%
+    extract_nested_test_forecast(.id_subset = input$type) %>%
+    rename(Model = .model_desc,
+         Value = .value,
+         Date = .index) %>%
+    mutate(Model = str_to_title(Model)) %>%
+    mutate(Model = Model %>% str_trunc(width = 25)) %>%
+    group_by(type) %>%
+    ggplot(aes(x=Date,y=Value,color=Model)) + 
+    geom_line() + 
+    theme_gdocs() +
+    scale_color_tableau() +
+    labs(color = "Legend") +
+    theme(plot.title = element_text(color = "#616161", face = "bold"),
+          legend.title = element_text(color = "#616161"),
+          legend.text = element_text(color = "#616161"),
+          text = element_text(family = "Roboto"),
+          strip.text = element_text(size=16)) + 
+    facet_wrap(~type, ncol=1)
+  
+  # Add interactivity
+  ggplotly(model_fit_test_plot, dynamicTicks = TRUE)
+})
+
+plotlyOutput(outputId = "plotly_daily_model_fit")
+
+```
+
+### Daily Model Accuracy
+
+```{r}
+output$reactable_1 <- renderReactable({
+    rv$pge_daily_model_tbl %>%
+        extract_nested_test_accuracy() %>%
+        filter(type %in% input$type) %>%
+        mutate(.model_desc = str_to_title(.model_desc)) %>% 
+        table_modeltime_accuracy(.title = "Model Accuracy on Test Set",
+                                 .interactive = TRUE,
+                                 showPageSizeOptions = TRUE,
+                                 pageSizeOptions = c(12, 18, 24),
+                                 pagination = TRUE,
+                                 highlight = TRUE,
+                                 defaultPageSize = 12,
+                                 onClick = "select",
+                                 theme = reactableTheme(color="#616161",
+                                                        highlightColor = "#aec7e8"))
+})
+
+reactableOutput("reactable_1")
+```
+
+### Monthly Predicted Forecast
+
+```{r}
+# Forecast predictions plot output
+output$plotly_monthly_prediction <- renderPlotly({
+  
+    
+    # # Useful if adding more time series selections
+    facet_col <- 1
+    if (length(input$type) > 3) facet_col <- 2
+    if (length(input$type) > 8) facet_col <- 4
+    
+    
+    monthly_forecast_plot <- rv$monthly_forecast_tbl %>%
+      rename(Model = .model_desc,
+             Value = .value,
+             Date = .index,
+             `CI Low` = .conf_lo,
+             `CI High` = .conf_hi) %>%
+      mutate(Model = str_to_title(Model)) %>%
+      mutate(Model = Model %>% str_trunc(width = 25)) %>%
+      group_by(type) %>%
+      ggplot(aes(x=Date,y=Value,color=Model)) + 
+      geom_line() + 
+      geom_ribbon(
+        aes(
+          ymin = `CI Low`,
+          ymax = `CI High`,
+          color = Model
+        ),
+        fill     = "grey20",
+        alpha    = 0.20,
+        linetype = 0
+      ) + 
+      theme_gdocs() +
+      scale_color_tableau() +
+      labs(color = "Legend") +
+      theme(plot.title = element_text(color = "#616161", face = "bold"),
+            legend.title = element_text(color = "#616161"),
+            legend.text = element_text(color = "#616161"),
+            text = element_text(family = "Roboto"),
+            strip.text = element_text(size=16)) + 
+      facet_wrap(~type, ncol=1)
+
+    ggplotly(monthly_forecast_plot, dynamicTicks = TRUE)
+})
+
+plotlyOutput(outputId = "plotly_monthly_prediction")
+```
+
+### Monthly Model Fit
+
+```{r}
+output$plotly_monthly_model_fit <- renderPlotly({
+  
+  # Useful if adding more time series selections
+  facet_col <- 1
+  if (length(input$type) > 3) facet_col <- 2
+  if (length(input$type) > 8) facet_col <- 4
+  
+  # Model fit plot
+  model_fit_test_plot <- rv$pge_monthly_model_tbl %>%
+    extract_nested_test_forecast(.id_subset = input$type) %>%
+    rename(Model = .model_desc,
+         Value = .value,
+         Date = .index) %>%
+    mutate(Model = str_to_title(Model)) %>%
+    mutate(Model = Model %>% str_trunc(width = 25)) %>%
+    group_by(type) %>%
+    ggplot(aes(x=Date,y=Value,color=Model)) + 
+    geom_line() + 
+    theme_gdocs() +
+    scale_color_tableau() +
+    labs(color = "Legend") +
+    theme(plot.title = element_text(color = "#616161", face = "bold"),
+          legend.title = element_text(color = "#616161"),
+          legend.text = element_text(color = "#616161"),
+          text = element_text(family = "Roboto"),
+          strip.text = element_text(size=16)) + 
+    facet_wrap(~type, ncol=1)
+  
+  # Add interactivity
+  ggplotly(model_fit_test_plot, dynamicTicks = TRUE)
+})
+
+plotlyOutput(outputId = "plotly_monthly_model_fit")
+```
+
+### Monthly Model Accuracy
+
+```{r}
+output$reactable_2 <- renderReactable({
+    rv$pge_monthly_model_tbl %>%
+        extract_nested_test_accuracy() %>%
+        filter(type %in% input$type) %>%
+        mutate(.model_desc = str_to_title(.model_desc)) %>% 
+        table_modeltime_accuracy(.title = "Model Accuracy on Test Set",
+                                 .interactive = TRUE,
+                                 showPageSizeOptions = TRUE,
+                                 pageSizeOptions = c(12, 18, 24),
+                                 pagination = TRUE,
+                                 highlight = TRUE,
+                                 defaultPageSize = 12,
+                                 onClick = "select",
+                                 theme = reactableTheme(color="#616161",
+                                                        highlightColor = "#aec7e8"))
+})
+
+reactableOutput("reactable_2")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
